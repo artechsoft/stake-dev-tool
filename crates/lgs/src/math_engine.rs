@@ -485,9 +485,11 @@ impl MathEngine {
 
     pub async fn get_mode(&self, game: &str, mode_name: &str) -> AppResult<GameMode> {
         let cfg = self.load_config(game).await?;
+        // Mode names are unique ignoring case in index.json, and front ends
+        // often send them upper-cased ("BASE"), so match the way the RGS does.
         cfg.modes
             .iter()
-            .find(|m| m.name == mode_name)
+            .find(|m| m.name.eq_ignore_ascii_case(mode_name))
             .cloned()
             .ok_or_else(|| AppError::ModeNotFound {
                 game: game.to_string(),

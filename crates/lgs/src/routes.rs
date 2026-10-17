@@ -126,7 +126,7 @@ async fn play(
         .forced_event
         .lock()
         .as_ref()
-        .filter(|f| f.mode == mode)
+        .filter(|f| f.mode.eq_ignore_ascii_case(&mode))
         .cloned();
 
     let result = if let Some(f) = forced {
@@ -152,7 +152,7 @@ async fn play(
         .forced_event
         .lock()
         .as_ref()
-        .is_some_and(|f| f.mode == mode);
+        .is_some_and(|f| f.mode.eq_ignore_ascii_case(&mode));
     state.sessions.push_event(
         &session_id,
         EventEntry {
@@ -377,7 +377,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_amount_and_unknown_mode_debit_nothing() {
+    async fn invalid_amount_and_unknown_mode_debit_nothing_and_case_is_ignored() {
         let tmp = tempfile::tempdir().expect("tmp");
         let state = demo_state(tmp.path());
         let start = auth(&state).await;
@@ -392,10 +392,17 @@ pub(crate) mod tests {
                 Err(AppError::InvalidRequest("invalid amount"))
             ));
         }
+        // Mode names match ignoring case, as front ends send "BASE".
+        play_as(&state, "BASE", BET, Some(1))
+            .await
+            .expect("upper-case mode");
         assert!(matches!(
             play_as(&state, "bonus", BET, None).await,
             Err(AppError::ModeNotFound { .. })
         ));
-        assert_eq!(state.sessions.get("s1").expect("session").balance, start);
+        assert_eq!(
+            state.sessions.get("s1").expect("session").balance,
+            start - BET
+        );
     }
 }
