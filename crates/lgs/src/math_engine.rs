@@ -461,9 +461,10 @@ impl MathEngine {
 
     async fn read_file(&self, game: &str, file: &str) -> AppResult<Vec<u8>> {
         let path = self.file_path(game, file);
-        fs::read(&path)
-            .await
-            .map_err(|e| AppError::Parse(format!("read {}: {e}", path.display())))
+        fs::read(&path).await.map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AppError::FileNotFound(path.display().to_string()),
+            _ => AppError::Parse(format!("read {}: {e}", path.display())),
+        })
     }
 
     pub async fn load_config(&self, game: &str) -> AppResult<Arc<GameConfig>> {
@@ -495,20 +496,16 @@ impl MathEngine {
     }
 
     /// The total stake a `base_bet` translates to in `mode_name` (bet × cost
-    /// multiplier, exact for fractional costs). Falls back to the bet itself
-    /// when the mode can't be resolved — `/play` surfaces the real error a
-    /// moment later.
+    /// multiplier, exact for fractional costs). An unknown mode is an error
+    /// here, before `/play` debits anything, as the RGS rejects it with
+    /// `ERR_VAL`.
     pub async fn total_bet_cost(
         &self,
         game: &str,
         mode_name: &str,
         base_bet: u64,
     ) -> AppResult<u64> {
-        Ok(self
-            .get_mode(game, mode_name)
-            .await
-            .map(|m| m.total_bet(base_bet))
-            .unwrap_or(base_bet))
+        Ok(self.get_mode(game, mode_name).await?.total_bet(base_bet))
     }
 
     pub async fn load_assets(&self, game: &str, mode: &GameMode) -> AppResult<Arc<ModeAssets>> {
@@ -657,7 +654,7 @@ impl MathEngine {
             .entries
             .iter()
             .find(|e| e.event_id == event_id)
-            .ok_or_else(|| AppError::Parse(format!("event {event_id} not found in weights")))?;
+            .ok_or(AppError::EventNotFound(event_id))?;
 
         self.build_result(
             &mode,
@@ -723,7 +720,7 @@ impl MathEngine {
             .entries
             .iter()
             .find(|e| e.event_id == event_id)
-            .ok_or_else(|| AppError::Parse(format!("event {event_id} not found in weights")))?;
+            .ok_or(AppError::EventNotFound(event_id))?;
         let state = read_event(&assets.books, entry.event_id)?;
         Ok(ReplayResult {
             payout_multiplier: entry.payout_multiplier,

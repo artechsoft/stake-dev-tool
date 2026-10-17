@@ -104,14 +104,14 @@ async fn play(
         .get(&session_id)
         .ok_or(AppError::SessionNotFound)?;
 
-    // Safety: if a previous round is still active (client called /play twice
-    // without /end-round), credit its pending payout before taking the new
-    // bet — otherwise the winnings would be lost when the active_round slot
-    // is overwritten below.
-    if let Some(round) = existing.active_round.as_ref()
-        && round.payout > 0
-    {
-        state.sessions.add_winnings(&session_id, round.payout);
+    // The RGS allows one active round per player and rejects a second /play
+    // until /end-round settles it. Rejecting here keeps the pending payout
+    // intact and surfaces front ends that skip /end-round on a win.
+    if existing.active_round.is_some() {
+        return Err(AppError::InvalidRequest("round already active"));
+    }
+    if !(config::MIN_BET..=config::MAX_BET).contains(&amount) || amount % config::STEP_BET != 0 {
+        return Err(AppError::InvalidRequest("invalid amount"));
     }
 
     let total_cost = state.engine.total_bet_cost(&game, &mode, amount).await?;
@@ -175,8 +175,9 @@ async fn play(
         amount,
         payout: result.payout,
         payout_multiplier: result.payout_multiplier as f64 / 100.0,
-        // Active until the client calls /end-round, which credits the payout.
-        active: true,
+        // As on the RGS, a 0x round closes inside /play. A winning round
+        // stays active until /end-round credits the payout.
+        active: result.payout > 0,
         mode,
         event: Some(result.event_id.to_string()),
         state: result.state,
@@ -184,7 +185,7 @@ async fn play(
 
     state
         .sessions
-        .set_active_round(&session_id, Some(round.clone()));
+        .set_active_round(&session_id, round.active.then(|| round.clone()));
 
     let final_session = state
         .sessions
@@ -220,11 +221,13 @@ async fn end_round(
     // Credit the pending round's payout now. /play only deducts the bet and
     // stores the outcome on active_round; we pay it out here so the client's
     // balance animation (spin → credit) matches the Stake Engine RGS contract.
-    if let Some(round) = session.active_round.as_ref()
-        && round.payout > 0
-    {
-        state.sessions.add_winnings(&session_id, round.payout);
-    }
+    // With no active round (a 0x round, or a repeated call) the RGS answers
+    // ERR_VAL.
+    let round = session
+        .active_round
+        .as_ref()
+        .ok_or(AppError::InvalidRequest("no active round"))?;
+    state.sessions.add_winnings(&session_id, round.payout);
     state.sessions.set_active_round(&session_id, None);
 
     let session = state
@@ -260,4 +263,139 @@ async fn bet_event(
         .get(&session_id)
         .ok_or(AppError::SessionNotFound)?;
     Ok(Json(BetEventResponse { event: body.event }))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::state::ForcedEvent;
+    use crate::tenant::{TenantId, TenantRegistry};
+    use std::io::Write;
+
+    const BET: u64 = 1_000_000;
+
+    /// One `base` mode with a 0x round (id 1) and a 2x round (id 2).
+    pub(crate) fn demo_state(dir: &std::path::Path) -> Arc<AppState> {
+        let game_dir = dir.join("demo");
+        std::fs::create_dir_all(&game_dir).expect("create game dir");
+        std::fs::write(
+            game_dir.join("index.json"),
+            r#"{"modes":[{"name":"base","cost":1,"events":"books_base.jsonl.zst","weights":"lookUpTable_base_0.csv"}]}"#,
+        )
+        .expect("write index");
+        std::fs::write(game_dir.join("lookUpTable_base_0.csv"), "1,1,0\n2,1,200\n")
+            .expect("write weights");
+        let books = "{\"id\":1,\"events\":[],\"payoutMultiplier\":0}\n\
+                     {\"id\":2,\"events\":[],\"payoutMultiplier\":200}\n";
+        let mut enc = zstd::Encoder::new(Vec::new(), 0).expect("zstd encoder");
+        enc.write_all(books.as_bytes()).expect("compress books");
+        std::fs::write(
+            game_dir.join("books_base.jsonl.zst"),
+            enc.finish().expect("finish zstd"),
+        )
+        .expect("write books");
+        TenantRegistry::new().get_or_create_disk(TenantId::from("test"), dir)
+    }
+
+    async fn auth(state: &Arc<AppState>) -> u64 {
+        let body = AuthBody {
+            session_id: Some("s1".into()),
+            language: None,
+        };
+        authenticate(State(state.clone()), Path("demo".into()), Json(body))
+            .await
+            .expect("authenticate")
+            .0
+            .balance
+            .amount
+    }
+
+    async fn play_as(
+        state: &Arc<AppState>,
+        mode: &str,
+        amount: u64,
+        event_id: Option<u32>,
+    ) -> AppResult<Round> {
+        *state.forced_event.lock() = event_id.map(|event_id| ForcedEvent {
+            mode: mode.into(),
+            event_id,
+        });
+        let body = PlayBody {
+            session_id: Some("s1".into()),
+            mode: Some(mode.into()),
+            amount: Some(amount),
+        };
+        play(State(state.clone()), Path("demo".into()), Json(body))
+            .await
+            .map(|r| r.0.round)
+    }
+
+    async fn end(state: &Arc<AppState>) -> AppResult<u64> {
+        let body = EndRoundBody {
+            session_id: Some("s1".into()),
+        };
+        end_round(State(state.clone()), Path("demo".into()), Json(body))
+            .await
+            .map(|r| r.0.balance.amount)
+    }
+
+    #[tokio::test]
+    async fn zero_win_round_closes_in_play() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let state = demo_state(tmp.path());
+        let start = auth(&state).await;
+
+        let round = play_as(&state, "base", BET, Some(1)).await.expect("play");
+        assert!(!round.active);
+        assert!(matches!(
+            end(&state).await,
+            Err(AppError::InvalidRequest("no active round"))
+        ));
+        // The next bet goes through without an end-round in between.
+        play_as(&state, "base", BET, Some(1))
+            .await
+            .expect("second play");
+        assert_eq!(
+            state.sessions.get("s1").expect("session").balance,
+            start - 2 * BET
+        );
+    }
+
+    #[tokio::test]
+    async fn winning_round_stays_active_until_end_round() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let state = demo_state(tmp.path());
+        let start = auth(&state).await;
+
+        let round = play_as(&state, "base", BET, Some(2)).await.expect("play");
+        assert!(round.active);
+        assert!(matches!(
+            play_as(&state, "base", BET, Some(2)).await,
+            Err(AppError::InvalidRequest("round already active"))
+        ));
+        assert_eq!(end(&state).await.expect("end-round"), start + BET);
+    }
+
+    #[tokio::test]
+    async fn invalid_amount_and_unknown_mode_debit_nothing() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let state = demo_state(tmp.path());
+        let start = auth(&state).await;
+
+        for amount in [
+            config::MIN_BET - 1,
+            config::MAX_BET + config::STEP_BET,
+            BET + 1,
+        ] {
+            assert!(matches!(
+                play_as(&state, "base", amount, None).await,
+                Err(AppError::InvalidRequest("invalid amount"))
+            ));
+        }
+        assert!(matches!(
+            play_as(&state, "bonus", BET, None).await,
+            Err(AppError::ModeNotFound { .. })
+        ));
+        assert_eq!(state.sessions.get("s1").expect("session").balance, start);
+    }
 }

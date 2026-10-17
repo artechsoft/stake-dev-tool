@@ -12,8 +12,14 @@ pub enum AppError {
     SessionNotFound,
     #[error("insufficient balance")]
     InsufficientBalance,
+    #[error("{0}")]
+    InvalidRequest(&'static str),
     #[error("mode \"{mode}\" not found for game \"{game}\"")]
     ModeNotFound { game: String, mode: String },
+    #[error("event {0} not found in weights")]
+    EventNotFound(u32),
+    #[error("file not found: {0}")]
+    FileNotFound(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("zstd error: {0}")]
@@ -24,17 +30,23 @@ pub enum AppError {
     Internal(#[from] anyhow::Error),
 }
 
+/// Matches the RGS error body, `{ "error": "ERR_*", "message": "..." }`, so a
+/// front end's error handling behaves here as it will in production.
 #[derive(Serialize)]
 struct ErrorBody {
-    error: String,
+    error: &'static str,
+    message: String,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let status = match &self {
-            AppError::MissingField(_) | AppError::InsufficientBalance => StatusCode::BAD_REQUEST,
-            AppError::SessionNotFound | AppError::ModeNotFound { .. } => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        let (status, code) = match &self {
+            AppError::InsufficientBalance => (StatusCode::BAD_REQUEST, "ERR_IPB"),
+            AppError::MissingField(_)
+            | AppError::InvalidRequest(_)
+            | AppError::SessionNotFound
+            | AppError::ModeNotFound { .. } => (StatusCode::BAD_REQUEST, "ERR_VAL"),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "ERR_GEN"),
         };
         // The cause used to travel in the response body ONLY: server-side all
         // that remained was `tower_http`'s bare "response failed", which made a
@@ -46,7 +58,8 @@ impl IntoResponse for AppError {
             tracing::debug!(error = %self, "LGS request rejected");
         }
         let body = Json(ErrorBody {
-            error: self.to_string(),
+            error: code,
+            message: self.to_string(),
         });
         (status, body).into_response()
     }
